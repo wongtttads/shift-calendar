@@ -27,8 +27,7 @@ def would_shift_on(d):
     """按规则计算当天轮班状态:None=休,'全天班','行政班'"""
     ph = phase_on(start, d)
     if ph == 0:
-        if cfg["full_shift_cancel_on_holiday"] and d in off_days:
-            return None
+        # 全天班铁打不动:任何节假日都要上,不取消
         return '全天班'
     if ph == 1:
         if cfg["admin_shift_cancel_on_holiday"] and d in off_days:
@@ -41,13 +40,20 @@ def would_shift_on(d):
 errors = []
 checks = []
 
-# --- 校验1:法定放假日不得有班 ---
-holiday_shifts = []
+# --- 校验1:法定放假日:全天班必须上班,行政班必须取消 ---
+holiday_full_missing = []   # 放假日轮到全天班却没有班(错误)
+holiday_admin_present = []  # 放假日轮到行政班却有班(错误)
 for d in sorted(off_days):
     if start <= d < end:
-        s = would_shift_on(d)
-        if s: holiday_shifts.append((d, s))
-checks.append(("法定放假日不应有班次", holiday_shifts, 0))
+        ph = phase_on(start, d)
+        if ph == 0:
+            s = would_shift_on(d)
+            if s != '全天班': holiday_full_missing.append((d, s))
+        elif ph == 1:
+            s = would_shift_on(d)
+            if s: holiday_admin_present.append((d, s))
+checks.append(("放假日全天班必须上班", holiday_full_missing, 0))
+checks.append(("放假日行政班必须取消", holiday_admin_present, 0))
 
 # --- 校验2:普通周末(非调休)行政班取消,全天班保留 ---
 weekend_admin_errors = []
