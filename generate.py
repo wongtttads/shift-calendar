@@ -13,7 +13,6 @@
 import argparse
 import json
 import sys
-import uuid
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -25,10 +24,10 @@ HOLIDAY_URL = "https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/{
 DEFAULT_CONFIG = {
     "title": "上二休二 班表",
     "start_date": "2026-08-27",          # 第一个全天班日期
-    "years": 1,                          # 生成跨度(年)
-    "full_shift_cancel_on_holiday": True,   # 全天班遇法定放假日取消
+    "years": 1,                          # 生成跨度(年):至少覆盖到今天+1年(滚动)
+    "full_shift_cancel_on_holiday": False,  # 全天班铁打不动,任何节假日照常上班
     "admin_shift_cancel_on_holiday": True,  # 行政班遇法定放假日取消
-    "admin_shift_cancel_on_weekend": True,  # 行政班遇周末取消
+    "admin_shift_cancel_on_weekend": True,  # 行政班遇周末取消(调休上班日除外)
     "show_rest": False,                  # 是否同时生成「休息」事件
     "timezone": "Asia/Shanghai",
     "holiday_source": "holiday-cn",      # 节假日数据源
@@ -45,31 +44,32 @@ def load_config():
 
 
 def fetch_holidays(year):
-    """从 holiday-cn 拉取某年节假日数据,优先本地缓存,失败返回空表。"""
+    """从 holiday-cn 拉取某年节假日数据。
+    网络优先(保证 Actions 每周拿到最新安排),失败时回退本地缓存,再失败返回空表。"""
     import urllib.request
     cache = BASE / "holidays" / f"{year}.json"
-    raw = None
-    if cache.exists():
-        try:
-            raw = cache.read_bytes()
-            data = json.loads(raw.decode("utf-8"))
-            if data.get("days"):
-                return _parse_holidays(data)
-        except Exception:
-            raw = None
     url = HOLIDAY_URL.format(year=year)
     try:
         with urllib.request.urlopen(url, timeout=20) as resp:
             raw = resp.read()
         data = json.loads(raw.decode("utf-8"))
-        try:
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_bytes(raw)
-        except Exception:
-            pass
+        # 完整性防御:仅当解析出的 days 列表不为空(数据源确实发布了安排)
+        # 且是完整 JSON 时才写缓存;避免把"部分下载/空占位"缓存覆盖好数据。
+        if data.get("days"):
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_bytes(raw)
+            except Exception:
+                pass
         return _parse_holidays(data)
     except Exception as exc:
-        print(f"[warn] 无法获取 {year} 节假日数据: {exc}", file=sys.stderr)
+        print(f"[warn] 无法获取 {year} 节假日数据: {exc},尝试本地缓存", file=sys.stderr)
+        if cache.exists():
+            try:
+                data = json.loads(cache.read_bytes().decode("utf-8"))
+                return _parse_holidays(data)
+            except Exception:
+                pass
         return set(), set()
 
 
@@ -97,10 +97,17 @@ def phase_on(start, d):
 
 def generate(cfg):
     start = date.fromisoformat(cfg["start_date"])
-    total_days = cfg["years"] * 365 + 2
+    # 滚动生成:结束日期 = max(起始+years年, 今天+1年+缓冲),保证订阅永不"断档"
+    span_days = cfg["years"] * 365 + 2
+    end = start + timedelta(days=span_days)
+    today = date.today()
+    min_end = today + timedelta(days=365 + 180)  # 至少未来一年半
+    if end < min_end:
+        end = min_end
+    total_days = (end - start).days
     off_days = set()
     work_extra = set()
-    years_needed = {start.year, (start + timedelta(days=total_days)).year}
+    years_needed = {start.year, end.year}
     for y in years_needed:
         o, w = fetch_holidays(y)
         off_days |= o
@@ -126,7 +133,10 @@ def generate(cfg):
         elif cfg["show_rest"]:
             events.append((d, "休息"))
 
-    # 写 ICS
+    # 写 ICS。UID 使用确定性值(日期+类型),保证同一事件跨版本 UID 稳定,
+    # 苹果日历订阅刷新时只做增量更新,不会"删旧建新"产生重复事件。
+    from datetime import datetime, timezone as dt_timezone
+    stamp = datetime.now(dt_timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -137,11 +147,11 @@ def generate(cfg):
         "X-WR-TIMEZONE:" + cfg["timezone"],
     ]
     for d, kind in events:
-        uid = f"shift-{d.isoformat()}-{kind}@{uuid.uuid4().hex[:8]}"
+        uid = f"shift-{d.isoformat()}-{kind}"
         lines += [
             "BEGIN:VEVENT",
             f"UID:{uid}",
-            f"DTSTAMP:{d.strftime('%Y%m%dT000000Z')}",
+            f"DTSTAMP:{stamp}",
             f"DTSTART;VALUE=DATE:{d.strftime('%Y%m%d')}",
             f"SUMMARY:{kind}",
             f"DESCRIPTION:{kind} - 上二休二轮班",
