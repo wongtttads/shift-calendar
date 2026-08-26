@@ -5,8 +5,8 @@
 规则:
   - 周期:全天班 → 行政班 → 休 → 休,循环
   - 取消制:排到班次的当天若命中「取消条件」则当天不上班,周期不滑动
-    * 全天班:法定放假日(isOffDay=true)取消;周末不取消
-    * 行政班:法定放假日或周末取消
+    * 全天班:铁打不动,任何节假日照常上班
+    * 行政班:遇法定放假日取消;遇普通周末取消(调休上班日除外)
   - 调休上班日(周末补班,isOffDay=false):不额外放假,若本应上班则照常上班
 输出:calendar.ics(iCalendar 标准,全天事件,供苹果日历订阅)
 """
@@ -107,8 +107,8 @@ def generate(cfg):
     total_days = (end - start).days
     off_days = set()
     work_extra = set()
-    years_needed = {start.year, end.year}
-    for y in years_needed:
+    # 覆盖跨度内【所有】年份(可能跨 3 个年份,不能只取首尾年份)
+    for y in range(start.year, end.year + 1):
         o, w = fetch_holidays(y)
         off_days |= o
         work_extra |= w

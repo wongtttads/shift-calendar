@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""全面校验生成规则:
-1. 法定放假日:全天班/行政班都应取消
-2. 周末(非调休):行政班取消,全天班不取消
-3. 调休上班日:若轮班排到班次(全天/行政)→ 必须上班,不得取消
-4. 周期正确性:全天班后必跟行政班(除非被取消)
+"""全面校验:直接对照 calendar.ics 实际输出与期望规则。
+
+规则:
+1. 法定放假日:全天班必须上班;行政班必须取消
+2. 普通周末(非调休):行政班取消,全天班照常
+3. 调休上班日(周末补班):轮班排到班次必须上班,不得因周末取消
+4. 周期正确性:全天班次日必为行政班(未被取消时)
+5. ICS 结构:VEVENT 配对、UID 唯一
 """
+import re
 import sys
-from collections import defaultdict
 from datetime import date, timedelta
 
 sys.path.insert(0, '.')
@@ -15,20 +18,30 @@ from generate import fetch_holidays, phase_on, load_config
 
 cfg = load_config()
 start = date.fromisoformat(cfg["start_date"])
-total_days = cfg["years"] * 365 + 2
-end = start + timedelta(days=total_days)
 
-off_days, work_extra = fetch_holidays(start.year)
-o2, w2 = fetch_holidays(end.year)
-off_days |= o2
-work_extra |= w2
+# ---- 读取实际 calendar.ics 输出 ----
+raw = open('calendar.ics', 'rb').read().decode('utf-8')
+events = dict(re.findall(r'DTSTART;VALUE=DATE:(\d{8})\r\nSUMMARY:([^\r\n]+)', raw))
+dates = sorted(events.keys())
+if not dates:
+    print("❌ calendar.ics 为空或解析失败")
+    sys.exit(1)
+d0 = date.fromisoformat(f'{dates[0][:4]}-{dates[0][4:6]}-{dates[0][6:]}')
+d1 = date.fromisoformat(f'{dates[-1][:4]}-{dates[-1][4:6]}-{dates[-1][6:]}')
 
-def would_shift_on(d):
-    """按规则计算当天轮班状态:None=休,'全天班','行政班'"""
+# ---- 覆盖范围内所有年份的节假日数据 ----
+off_days, work_extra = set(), set()
+for y in range(d0.year, d1.year + 1):
+    o, w = fetch_holidays(y)
+    off_days |= o
+    work_extra |= w
+
+
+def expect_on(d):
+    """期望班次:None=无班,'全天班'/'行政班'=有班"""
     ph = phase_on(start, d)
     if ph == 0:
-        # 全天班铁打不动:任何节假日都要上,不取消
-        return '全天班'
+        return '全天班'  # 铁打不动
     if ph == 1:
         if cfg["admin_shift_cancel_on_holiday"] and d in off_days:
             return None
@@ -37,102 +50,67 @@ def would_shift_on(d):
         return '行政班'
     return None
 
-errors = []
-checks = []
 
-# --- 校验1:法定放假日:全天班必须上班,行政班必须取消 ---
-holiday_full_missing = []   # 放假日轮到全天班却没有班(错误)
-holiday_admin_present = []  # 放假日轮到行政班却有班(错误)
+WD = '一二三四五六日'
+n = (d1 - d0).days + 1
+errs = []
+stats = {'全天班': 0, '行政班': 0, '放假日全天照上': 0,
+         '放假日行政取消': 0, '周末行政取消': 0, '调休日上班': 0}
+
+for i in range(n):
+    d = d0 + timedelta(days=i)
+    key = d.strftime('%Y%m%d')
+    got = events.get(key)
+    exp = expect_on(d)
+    if exp != got:
+        errs.append((d, exp, got))
+    if exp == '全天班':
+        stats['全天班'] += 1
+        if d in off_days:
+            stats['放假日全天照上'] += 1
+        if d in work_extra:
+            stats['调休日上班'] += 1
+    elif exp == '行政班':
+        stats['行政班'] += 1
+        if d in work_extra:
+            stats['调休日上班'] += 1
+    elif d in off_days and phase_on(start, d) == 1:
+        stats['放假日行政取消'] += 1
+    elif d.weekday() >= 5 and phase_on(start, d) == 1:
+        stats['周末行政取消'] += 1
+
+# ---- ICS 结构检查 ----
+begin = raw.count('BEGIN:VEVENT')
+endv = raw.count('END:VEVENT')
+uids = re.findall(r'UID:([^\r\n]+)', raw)
+dup_uids = len(uids) - len(set(uids))
+
+print(f"=== 核对范围 {d0} ~ {d1}({n} 天) ===")
+print(f"实际事件: {len(events)} | VEVENT 配对: {begin}/{endv} | UID 重复: {dup_uids}")
+for k, v in stats.items():
+    print(f"  {k}: {v}")
+
+print(f"\n错误数: {len(errs)}")
+for d, exp, got in errs[:15]:
+    print(f"  ❌ {d} 周{WD[d.weekday()]} 期望{exp or '无班'} 实际{got or '无班'}")
+
+# ---- 调休上班日明细 ----
+print("\n=== 调休上班日(周末补班)与轮班对照 ===")
+for d in sorted(work_extra):
+    if d0 <= d <= d1:
+        ph = {0: '全天班', 1: '行政班', 2: '休', 3: '休'}[phase_on(start, d)]
+        s = events.get(d.strftime('%Y%m%d'))
+        mark = f"→ 上班({s})" if s else "→ 休息(轮班正好休)"
+        print(f"  {d} 周{WD[d.weekday()]} 轮班={ph} {mark}")
+
+# ---- 放假日明细 ----
+print("\n=== 放假日处理明细 ===")
 for d in sorted(off_days):
-    if start <= d < end:
-        ph = phase_on(start, d)
-        if ph == 0:
-            s = would_shift_on(d)
-            if s != '全天班': holiday_full_missing.append((d, s))
-        elif ph == 1:
-            s = would_shift_on(d)
-            if s: holiday_admin_present.append((d, s))
-checks.append(("放假日全天班必须上班", holiday_full_missing, 0))
-checks.append(("放假日行政班必须取消", holiday_admin_present, 0))
+    if d0 <= d <= d1:
+        ph = {0: '全天班', 1: '行政班', 2: '休', 3: '休'}[phase_on(start, d)]
+        s = events.get(d.strftime('%Y%m%d'))
+        print(f"  {d} 周{WD[d.weekday()]} 轮班={ph} 实际: {s or '无班'}")
 
-# --- 校验2:普通周末(非调休)行政班取消,全天班保留 ---
-weekend_admin_errors = []
-weekend_full_ok = 0
-for i in range(total_days):
-    d = start + timedelta(days=i)
-    if d.weekday() >= 5 and d not in off_days and d not in work_extra:
-        ph = phase_on(start, d)
-        if ph == 1:
-            s = would_shift_on(d)
-            if s: weekend_admin_errors.append((d, s))
-        if ph == 0 and would_shift_on(d) == '全天班':
-            weekend_full_ok += 1
-checks.append(("普通周末行政班不应有班", weekend_admin_errors, 0))
-
-# --- 校验3:调休上班日(周末补班)排到班次必须上班 ---
-extra_missed = []
-extra_ok = []
-for d in sorted(work_extra):
-    if start <= d < end:
-        ph = phase_on(start, d)
-        if ph in (0, 1):
-            s = would_shift_on(d)
-            if s:
-                extra_ok.append((d, ph, s))
-            else:
-                extra_missed.append((d, ph))
-checks.append(("调休上班日排到班必须上班(漏排)", extra_missed, 0))
-
-# --- 校验4:周期顺序(未被取消时,全天班次日必为行政班) ---
-seq_errors = []
-prev = None  # (date, kind)
-for i in range(total_days):
-    d = start + timedelta(days=i)
-    s = would_shift_on(d)
-    if s is None:
-        prev = None
-        continue
-    if prev == '全天班' and s != '行政班':
-        seq_errors.append((prev_date, '全天班', d, s))
-    prev = s
-    prev_date = d
-checks.append(("全天班后应接行政班", seq_errors, 0))
-
-print(f"=== 核对范围 {start} ~ {end} ===")
-print(f"放假日: {len([d for d in off_days if start<=d<end])} 天 | "
-      f"调休上班日: {len([d for d in work_extra if start<=d<end])} 天 | "
-      f"周末行政班应取消: 见下\n")
-
-all_ok = True
-for name, items, _ in checks:
-    if items:
-        all_ok = False
-        print(f"❌ {name}: {len(items)} 处问题")
-        for it in items[:20]:
-            print("   ", it)
-    else:
-        print(f"✅ {name}: 无问题")
-
-if all_ok:
-    print("\n🎉 全部规则校验通过!")
-else:
-    print("\n⚠️ 存在上述问题,需要修复")
-
-# --- 输出调休上班日明细供人工复核 ---
-print("\n=== 2026-2027 调休上班日(周末补班)与轮班对照 ===")
-for d in sorted(work_extra):
-    if start <= d < end:
-        ph = {0:'全天班',1:'行政班',2:'休',3:'休'}[phase_on(start, d)]
-        wk = '六日一二三四五'[d.weekday()]
-        s = would_shift_on(d)
-        mark = "→ 上班" if s else "→ 休息(轮班正好休)"
-        print(f"  {d} 周{wk} 轮班={ph} {mark}")
-
-# --- 输出周末行政班取消明细 ---
-print("\n=== 普通周末行政班(被取消)明细 ===")
-cnt = 0
-for i in range(total_days):
-    d = start + timedelta(days=i)
-    if d.weekday() >= 5 and d not in off_days and d not in work_extra and phase_on(start, d) == 1:
-        cnt += 1
-print(f"  共 {cnt} 个(全部取消,无班次)")
+ok = not errs and begin == endv and dup_uids == 0 and len(events) > 0
+print("\n🎉 全部校验通过!" if ok else "\n⚠️ 发现问题,需修复!")
+sys.exit(0 if ok else 1)
