@@ -1,0 +1,11 @@
+{
+  "title": "上二休二 班表",
+  "start_date": "2026-08-27",
+  "years": 1,
+  "full_shift_cancel_on_holiday": true,
+  "admin_shift_cancel_on_holiday": true,
+  "admin_shift_cancel_on_weekend": true,
+  "show_rest": false,
+  "timezone": "Asia/Shanghai",
+  "holiday_source": "holiday-cn"
+}
