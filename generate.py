@@ -45,20 +45,40 @@ def load_config():
 
 
 def fetch_holidays(year):
-    """从 holiday-cn 拉取某年节假日数据。失败返回空表。"""
+    """从 holiday-cn 拉取某年节假日数据,优先本地缓存,失败返回空表。"""
     import urllib.request
+    cache = BASE / "holidays" / f"{year}.json"
+    raw = None
+    if cache.exists():
+        try:
+            raw = cache.read_bytes()
+            data = json.loads(raw.decode("utf-8"))
+            if data.get("days"):
+                return _parse_holidays(data)
+        except Exception:
+            raw = None
     url = HOLIDAY_URL.format(year=year)
     try:
         with urllib.request.urlopen(url, timeout=20) as resp:
             raw = resp.read()
         data = json.loads(raw.decode("utf-8"))
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_bytes(raw)
+        except Exception:
+            pass
+        return _parse_holidays(data)
     except Exception as exc:
         print(f"[warn] 无法获取 {year} 节假日数据: {exc}", file=sys.stderr)
         return set(), set()
+
+
+def _parse_holidays(data):
     off_days = set()     # 放假日
     work_extra = set()   # 调休上班日(周末补班)
     days = data.get("days", [])
     if not days:
+        year = data.get("year")
         print(f"[info] {year} 年节假日安排尚未公布(国务院通常年底发布),"
               f"该年日期暂按普通工作日处理", file=sys.stderr)
     for day in days:
@@ -97,7 +117,10 @@ def generate(cfg):
         elif phase == 1:    # 行政班
             if cfg["admin_shift_cancel_on_holiday"] and d in off_days:
                 continue
-            if cfg["admin_shift_cancel_on_weekend"] and d.weekday() >= 5:
+            # 周末取消,但调休上班日(如周六补班)不取消:那天本来就要上班
+            if (cfg["admin_shift_cancel_on_weekend"]
+                    and d.weekday() >= 5
+                    and d not in work_extra):
                 continue
             events.append((d, "行政班"))
         elif cfg["show_rest"]:
